@@ -3,7 +3,6 @@ import {
   GoogleGenAI,
   HarmCategory,
   HarmBlockThreshold,
-  GenerationConfig,
   Content,
   Part,
   FinishReason as GeminiFinishReason,
@@ -13,14 +12,63 @@ import {
   GenerateContentConfig,
 } from '@google/genai';
 
+import mime from 'mime';
+
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(express.json());
 
+// Helper function to fetch image and convert to base64
+async function fetchImageAsBase64(imageUrl: string): Promise<{ base64Data: string; mimeType: string }> {
+  try {
+    const response = await fetch(imageUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch image: ${response.status} ${response.statusText} from URL: ${imageUrl}`);
+    }
+    const imageBuffer = await response.arrayBuffer();
+    const base64Data = Buffer.from(imageBuffer).toString('base64');
+    
+    let detectedMimeType = response.headers.get('content-type');
+    if (!detectedMimeType || !detectedMimeType.startsWith('image/')) {
+      const typeFromUrl = mime.getType(imageUrl);
+      if (typeFromUrl && typeFromUrl.startsWith('image/')) {
+        detectedMimeType = typeFromUrl;
+      } else {
+        // Fallback or throw error if essential. Common types: image/jpeg, image/png, image/webp, etc.
+        // Gemini example used image/png. Let's default to jpeg if truly unknown.
+        console.warn(`Could not reliably determine MIME type for ${imageUrl}. Defaulting to image/jpeg.`);
+        detectedMimeType = 'image/jpeg'; 
+      }
+    }
+    return { base64Data, mimeType: detectedMimeType };
+  } catch (error) {
+    console.error(`Error fetching image ${imageUrl}:`, error);
+    throw error; // Re-throw to be handled by the main error handler
+  }
+}
+
+
+// Define new interfaces for OpenAI message content parts
+interface OpenAIContentTextPart {
+  type: 'text';
+  text: string;
+}
+
+interface OpenAIContentImageUrlPart {
+  type: 'image_url';
+  image_url: {
+    url: string;
+    // detail?: string; // Optional, not used by Gemini in this way
+  };
+}
+
+type OpenAIContentPart = OpenAIContentTextPart | OpenAIContentImageUrlPart;
+
+// Modify OpenAIMessage interface
 interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: string | OpenAIContentPart[]; // Can be string or array of parts
 }
 
 interface OpenAIChatCompletionRequest {
@@ -59,7 +107,7 @@ const mapGeminiFinishReasonToOpenAI = (reason: GeminiFinishReason | undefined): 
     case GeminiFinishReason.SAFETY:
       return 'content_filter';
     case GeminiFinishReason.RECITATION:
-      return 'stop'; 
+      return 'stop';
     case GeminiFinishReason.OTHER:
     default:
       return 'stop';
@@ -73,7 +121,9 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
   console.log(`  Headers: ${JSON.stringify(req.headers, null, 2)}`);
   console.log(`  Body: ${JSON.stringify(req.body, null, 2)}`);
 
+
   const authHeader = req.headers.authorization;
+  // ... existing API key handling ...
   let apiKey: string | undefined;
 
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -86,7 +136,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
   }
 
   try {
-    const requestBody = req.body as OpenAIChatCompletionRequest;
+    const requestBody = req.body as OpenAIChatCompletionRequest; // This will now use the new OpenAIMessage
     const { model: modelName, messages: openAIMessages, temperature } = requestBody;
 
     if (!modelName || !openAIMessages || !Array.isArray(openAIMessages)) {
@@ -97,60 +147,98 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     const genAI = new GoogleGenAI({ apiKey });
 
     const systemMessage = openAIMessages.find(msg => msg.role === 'system');
-    const geminiSystemInstruction: Content | undefined = systemMessage
-      ? { parts: [{ text: systemMessage.content }], role: 'system' } 
-      : undefined;
+    let geminiSystemInstruction: Content | undefined = undefined;
 
-    const geminiContents: Content[] = openAIMessages
-      .filter(msg => msg.role === 'user' || msg.role === 'assistant')
-      .map(msg => ({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: msg.content }],
-      }));
+    if (systemMessage) {
+        if (typeof systemMessage.content === 'string') {
+            geminiSystemInstruction = { parts: [{ text: systemMessage.content }], role: 'system' };
+        } else {
+            // Handle system message if it can also be complex (though typically it's string)
+            // For now, assuming system message content is string as per common usage.
+            // If system messages can also have image_url, this part would need expansion.
+            console.warn("System message content is complex, only string content is currently processed for system instructions.");
+            // Find first text part for system instruction if complex
+            const firstTextPart = systemMessage.content.find(p => p.type === 'text') as OpenAIContentTextPart | undefined;
+            if (firstTextPart) {
+                 geminiSystemInstruction = { parts: [{ text: firstTextPart.text }], role: 'system' };
+            }
+        }
+    }
+    
+    const geminiContents: Content[] = [];
+    for (const openAIMsg of openAIMessages) {
+      if (openAIMsg.role === 'system') continue; // System message handled separately
+
+      const currentGeminiParts: Part[] = [];
+      const imagePartsForGemini: Part[] = [];
+      const textPartsForGemini: Part[] = [];
+
+      if (typeof openAIMsg.content === 'string') {
+        textPartsForGemini.push({ text: openAIMsg.content });
+      } else { // Content is an array of OpenAIContentPart
+        for (const part of openAIMsg.content) {
+          if (part.type === 'text') {
+            textPartsForGemini.push({ text: part.text });
+          } else if (part.type === 'image_url') {
+            try {
+              const { base64Data, mimeType } = await fetchImageAsBase64(part.image_url.url);
+              imagePartsForGemini.push({ inlineData: { data: base64Data, mimeType: mimeType } });
+            } catch (e: any) {
+              console.error(`Failed to process image URL ${part.image_url.url}: ${e.message}`);
+              // Optionally, inform the client or skip this part. For now, logging and continuing.
+              // Could also push an error text part: textPartsForGemini.push({ text: `[Error processing image: ${part.image_url.url}]` });
+              res.status(400).json({ error: `Failed to process image from URL: ${part.image_url.url}. ${e.message}` });
+              return;
+            }
+          }
+        }
+      }
+      
+      // Add image parts first, then text parts, as per user's Gemini example structure
+      currentGeminiParts.push(...imagePartsForGemini);
+      currentGeminiParts.push(...textPartsForGemini);
+
+      if (currentGeminiParts.length > 0) {
+        geminiContents.push({
+          role: openAIMsg.role === 'assistant' ? 'model' : 'user',
+          parts: currentGeminiParts,
+        });
+      }
+    }
     
     if (geminiContents.length === 0 && !geminiSystemInstruction) {
-        res.status(400).json({ error: 'No user/assistant messages or system instruction provided.' });
+        res.status(400).json({ error: 'No user/assistant messages or system instruction provided after processing.' });
         return;
     }
 
-    const geminiGenerationConfig: GenerateContentConfig = {
+    // Use GenerateContentConfig for all configurations
+    const geminiAPIConfig: GenerateContentConfig = {
       temperature: temperature ?? 0.9,
       responseMimeType: 'text/plain',
-      thinkingConfig: {
-        thinkingBudget: 0,
-      },
-      safetySettings: [
-        {
-          category: HarmCategory.HARM_CATEGORY_HARASSMENT,
-          threshold: HarmBlockThreshold.BLOCK_NONE,  // Block none
-        },
-        {
-          category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-          threshold: HarmBlockThreshold.BLOCK_NONE,  // Block none
-        },
-        {
-          category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-          threshold: HarmBlockThreshold.BLOCK_NONE,  // Block none
-        },
-        {
-          category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-          threshold: HarmBlockThreshold.BLOCK_NONE,  // Block none
-        },
+      // thinkingConfig: { thinkingBudget: 0 }, // From user example, include if desired
+      safetySettings: [ // Default safety settings, user example had DANGEROUS_CONTENT only
+        { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE }, // User example: BLOCK_ONLY_HIGH
       ],
-      systemInstruction: geminiSystemInstruction,
+      systemInstruction: geminiSystemInstruction, // This is Content | undefined
     };
+    // If user example's thinkingConfig is desired:
+    if (geminiAPIConfig) { // Ensure geminiAPIConfig is not undefined if we add optional properties
+        geminiAPIConfig.thinkingConfig = { thinkingBudget: 0 }; // As per user example
+    }
 
-    // Corrected SDK usage: Call generateContent directly on genAI.models
-    // All parameters (model, contents, generationConfig, safetySettings, systemInstruction) 
-    // are passed in the single request object here.
+
     const result: GenerateContentResponse = await genAI.models.generateContent({
         model: modelName,
         contents: geminiContents,
-        config: geminiGenerationConfig
+        config: geminiAPIConfig, // Pass the combined config object
     });
     
-    const geminiResponse = result; // result is already the GenerateContentResponse
+    const geminiResponse = result; 
 
+    // ... rest of the response processing and error handling ...
     if (!geminiResponse || !geminiResponse.candidates || geminiResponse.candidates.length === 0) {
       console.error('No response or candidates from Gemini API:', JSON.stringify(geminiResponse, null, 2));
       const blockReason = geminiResponse?.promptFeedback?.blockReason;
@@ -170,7 +258,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
 
     const candidate = geminiResponse.candidates[0];
     const fullText = (candidate.content && candidate.content.parts && candidate.content.parts.length > 0)
-        ? candidate.content.parts.map((part: Part) => part.text).join('')
+        ? candidate.content.parts.map((part: Part) => part.text).join('') // Note: if model returns mixed content, this only gets text
         : '';
 
     const finishReason = mapGeminiFinishReasonToOpenAI(candidate.finishReason);
@@ -236,3 +324,8 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
 app.listen(port, () => {
   console.log('Reverse proxy server listening on http://localhost:' + port);
 });
+
+// To run this server:
+// 1. Ensure @google/genai, express, and mime are installed.
+// 2. Run: npm run dev (or yarn dev, if your dev script in package.json is like "vite-node src/index.ts")
+// 3. Send requests with "Authorization: Bearer YOUR_GEMINI_API_KEY" header.
