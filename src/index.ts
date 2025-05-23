@@ -48,6 +48,45 @@ async function fetchImageAsBase64(imageUrl: string): Promise<{ base64Data: strin
   }
 }
 
+// Helper function to fetch audio and convert to base64
+async function fetchAudioAsBase64(audioUrl: string): Promise<{ base64Data: string; mimeType: string }> {
+  try {
+    const response = await fetch(audioUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch audio: ${response.status} ${response.statusText} from URL: ${audioUrl}`);
+    }
+    const audioBuffer = await response.arrayBuffer();
+    const base64Data = Buffer.from(audioBuffer).toString('base64');
+    
+    let detectedMimeType = response.headers.get('content-type');
+    // Basic validation for audio MIME types
+    if (!detectedMimeType || !detectedMimeType.startsWith('audio/')) {
+      const typeFromUrl = mime.getType(audioUrl);
+      if (typeFromUrl && typeFromUrl.startsWith('audio/')) {
+        detectedMimeType = typeFromUrl;
+      } else {
+        console.warn(`Could not reliably determine MIME type for ${audioUrl}. Attempting to default based on extension or to a generic audio type.`);
+        // Attempt to infer from common audio extensions if mime.getType failed or was not specific enough
+        if (audioUrl.endsWith('.mp3')) detectedMimeType = 'audio/mpeg';
+        else if (audioUrl.endsWith('.wav')) detectedMimeType = 'audio/wav';
+        else if (audioUrl.endsWith('.ogg')) detectedMimeType = 'audio/ogg';
+        else if (audioUrl.endsWith('.m4a')) detectedMimeType = 'audio/mp4'; // m4a is often audio/mp4
+        else if (audioUrl.endsWith('.aac')) detectedMimeType = 'audio/aac';
+        else if (audioUrl.endsWith('.flac')) detectedMimeType = 'audio/flac';
+        else {
+            // Fallback to a generic audio type if still unknown, though Gemini might prefer more specific types
+            detectedMimeType = 'application/octet-stream'; // Or handle as an error
+             console.warn(`Using fallback MIME type ${detectedMimeType} for ${audioUrl}. Specific audio type preferred.`);
+        }
+      }
+    }
+    return { base64Data, mimeType: detectedMimeType };
+  } catch (error) {
+    console.error(`Error fetching audio ${audioUrl}:`, error);
+    throw error; // Re-throw to be handled by the main error handler
+  }
+}
+
 
 // Define new interfaces for OpenAI message content parts
 interface OpenAIContentTextPart {
@@ -63,7 +102,14 @@ interface OpenAIContentImageUrlPart {
   };
 }
 
-type OpenAIContentPart = OpenAIContentTextPart | OpenAIContentImageUrlPart;
+interface OpenAIContentAudioUrlPart {
+  type: 'audio_url';
+  audio_url: {
+    url: string;
+  };
+}
+
+type OpenAIContentPart = OpenAIContentTextPart | OpenAIContentImageUrlPart | OpenAIContentAudioUrlPart;
 
 // Modify OpenAIMessage interface
 interface OpenAIMessage {
@@ -75,6 +121,9 @@ interface OpenAIChatCompletionRequest {
   model: string;
   messages: OpenAIMessage[];
   temperature?: number;
+  // stream?: boolean; // Not yet supported
+  // max_tokens?: number; // Not directly mapped, Gemini uses other limits
+  reasoning_effort?: 'low' | 'medium' | 'high' | 'none'; // Added reasoning_effort
 }
 
 interface OpenAIChatCompletionResponse {
@@ -136,8 +185,8 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
   }
 
   try {
-    const requestBody = req.body as OpenAIChatCompletionRequest; // This will now use the new OpenAIMessage
-    const { model: modelName, messages: openAIMessages, temperature } = requestBody;
+    const requestBody = req.body as OpenAIChatCompletionRequest;
+    const { model: modelName, messages: openAIMessages, temperature, reasoning_effort } = requestBody; // Added reasoning_effort
 
     if (!modelName || !openAIMessages || !Array.isArray(openAIMessages)) {
       res.status(400).json({ error: 'Missing or invalid model or messages in request body' });
@@ -170,7 +219,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
       if (openAIMsg.role === 'system') continue; // System message handled separately
 
       const currentGeminiParts: Part[] = [];
-      const imagePartsForGemini: Part[] = [];
+      const mediaPartsForGemini: Part[] = []; // Combined for images and audio
       const textPartsForGemini: Part[] = [];
 
       if (typeof openAIMsg.content === 'string') {
@@ -182,20 +231,27 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
           } else if (part.type === 'image_url') {
             try {
               const { base64Data, mimeType } = await fetchImageAsBase64(part.image_url.url);
-              imagePartsForGemini.push({ inlineData: { data: base64Data, mimeType: mimeType } });
+              mediaPartsForGemini.push({ inlineData: { data: base64Data, mimeType: mimeType } });
             } catch (e: any) {
               console.error(`Failed to process image URL ${part.image_url.url}: ${e.message}`);
-              // Optionally, inform the client or skip this part. For now, logging and continuing.
-              // Could also push an error text part: textPartsForGemini.push({ text: `[Error processing image: ${part.image_url.url}]` });
               res.status(400).json({ error: `Failed to process image from URL: ${part.image_url.url}. ${e.message}` });
+              return;
+            }
+          } else if (part.type === 'audio_url') {
+            try {
+              const { base64Data, mimeType } = await fetchAudioAsBase64(part.audio_url.url);
+              mediaPartsForGemini.push({ inlineData: { data: base64Data, mimeType: mimeType } });
+            } catch (e: any) {
+              console.error(`Failed to process audio URL ${part.audio_url.url}: ${e.message}`);
+              res.status(400).json({ error: `Failed to process audio from URL: ${part.audio_url.url}. ${e.message}` });
               return;
             }
           }
         }
       }
       
-      // Add image parts first, then text parts, as per user's Gemini example structure
-      currentGeminiParts.push(...imagePartsForGemini);
+      // Add media parts first (images, audio), then text parts
+      currentGeminiParts.push(...mediaPartsForGemini);
       currentGeminiParts.push(...textPartsForGemini);
 
       if (currentGeminiParts.length > 0) {
@@ -215,20 +271,40 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     const geminiAPIConfig: GenerateContentConfig = {
       temperature: temperature ?? 0.9,
       responseMimeType: 'text/plain',
-      // thinkingConfig: { thinkingBudget: 0 }, // From user example, include if desired
-      safetySettings: [ // Default safety settings, user example had DANGEROUS_CONTENT only
+      safetySettings: [ 
         { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
         { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
         { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE }, // User example: BLOCK_ONLY_HIGH
+        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
       ],
-      systemInstruction: geminiSystemInstruction, // This is Content | undefined
+      systemInstruction: geminiSystemInstruction,
     };
-    // If user example's thinkingConfig is desired:
-    if (geminiAPIConfig) { // Ensure geminiAPIConfig is not undefined if we add optional properties
-        geminiAPIConfig.thinkingConfig = { thinkingBudget: 0 }; // As per user example
-    }
 
+    // Handle reasoning_effort to set thinkingBudget
+    let thinkingBudget = 0; // Default to 0 if not specified or "none"
+    if (reasoning_effort) {
+      switch (reasoning_effort) {
+        case 'low':
+          thinkingBudget = 1000;
+          break;
+        case 'medium':
+          thinkingBudget = 8000;
+          break;
+        case 'high':
+          thinkingBudget = 24000;
+          break;
+        case 'none':
+          thinkingBudget = 0;
+          break;
+        default:
+          // Log invalid value but proceed with default 0
+          console.warn(`Invalid reasoning_effort value: ${reasoning_effort}. Defaulting to thinking budget 0.`);
+          break;
+      }
+    }
+    // Only add thinkingConfig if budget is explicitly set by reasoning_effort or if it was the previous default
+    // The previous default was to always add thinkingBudget: 0. We will maintain this if no reasoning_effort is given.
+    geminiAPIConfig.thinkingConfig = { thinkingBudget: thinkingBudget };
 
     const result: GenerateContentResponse = await genAI.models.generateContent({
         model: modelName,
@@ -238,7 +314,6 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     
     const geminiResponse = result; 
 
-    // ... rest of the response processing and error handling ...
     if (!geminiResponse || !geminiResponse.candidates || geminiResponse.candidates.length === 0) {
       console.error('No response or candidates from Gemini API:', JSON.stringify(geminiResponse, null, 2));
       const blockReason = geminiResponse?.promptFeedback?.blockReason;
@@ -324,8 +399,3 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
 app.listen(port, () => {
   console.log('Reverse proxy server listening on http://localhost:' + port);
 });
-
-// To run this server:
-// 1. Ensure @google/genai, express, and mime are installed.
-// 2. Run: npm run dev (or yarn dev, if your dev script in package.json is like "vite-node src/index.ts")
-// 3. Send requests with "Authorization: Bearer YOUR_GEMINI_API_KEY" header.
