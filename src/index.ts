@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import https from 'https';
 import {
   GoogleGenAI,
   HarmCategory,
@@ -46,6 +47,91 @@ async function fetchImageAsBase64(imageUrl: string): Promise<{ base64Data: strin
     console.error(`Error fetching image ${imageUrl}:`, error);
     throw error; // Re-throw to be handled by the main error handler
   }
+}
+
+// Helper function to resolve a single redirect URL
+async function resolveRedirect(url: string): Promise<string> {
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    // console.warn(`Skipping redirect resolution for non-HTTP/S URL: ${url}`);
+    return url;
+  }
+  try {
+    const response = await fetch(url, { method: 'GET', redirect: 'follow' });
+    return response.url || url; // response.url should be the final URL after all redirects
+  } catch (error) {
+    console.error(`Error resolving redirect for ${url}:`, error);
+    return url; // Return original URL in case of an error
+  }
+}
+
+// Function to resolve redirects
+async function resolveRedirects(url: string, visitedUrls: Set<string> = new Set()): Promise<string> {
+  if (visitedUrls.has(url)) {
+    console.error(`Circular redirect detected for URL: ${url}`);
+    return url; // Avoid infinite loops
+  }
+  visitedUrls.add(url);
+
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const options = {
+      method: 'HEAD',
+      hostname: parsedUrl.hostname,
+      path: parsedUrl.pathname + parsedUrl.search,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      headers: {
+        'User-Agent': 'Gemini-Reverse-Proxy/1.0' // It's good practice to set a User-Agent
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        // Resolve relative redirects
+        const redirectUrl = new URL(res.headers.location, url).toString();
+        // Limit recursion depth if necessary, or rely on visitedUrls for cycles
+        if (visitedUrls.size > 10) { // Max 10 redirects
+            console.error(`Max redirects exceeded for URL: ${url}`);
+            resolve(url); // Return the last known URL before exceeding max redirects
+            return;
+        }
+        resolve(resolveRedirects(redirectUrl, visitedUrls));
+      } else if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+        resolve(url); // Final URL
+      } else {
+        console.error(`Failed to resolve URL: ${url}, Status: ${res.statusCode}`);
+        resolve(url); // Return original URL on error or non-redirect/success status
+      }
+    });
+
+    req.on('error', (e) => {
+      console.error(`Error resolving URL ${url}: ${e.message}`);
+      resolve(url); // Return original URL on request error
+    });
+
+    req.end();
+  });
+}
+
+// Helper function to process grounding chunks and add resolved URIs
+async function getResolvedGroundingChunks(groundingChunks: any[] | undefined): Promise<any[] | undefined> {
+  if (!groundingChunks) {
+    return undefined;
+  }
+  return Promise.all(
+    groundingChunks.map(async (chunk) => {
+      if (chunk.web && chunk.web.uri) {
+        const resolvedUri = await resolveRedirect(chunk.web.uri);
+        return {
+          ...chunk,
+          web: {
+            ...chunk.web,
+            resolved_uri: resolvedUri, // Adds a new field with the resolved URI
+          },
+        };
+      }
+      return chunk;
+    })
+  );
 }
 
 // Helper function to fetch audio and convert to base64
@@ -165,10 +251,10 @@ const mapGeminiFinishReasonToOpenAI = (reason: GeminiFinishReason | undefined): 
 
 app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<void> => {
   console.log(`[${new Date().toISOString()}] Incoming request:`);
-  console.log(`  Method: ${req.method}`);
-  console.log(`  URL: ${req.originalUrl}`);
-  console.log(`  Headers: ${JSON.stringify(req.headers, null, 2)}`);
-  console.log(`  Body: ${JSON.stringify(req.body, null, 2)}`);
+  // console.log(`  Method: ${req.method}`);
+  // console.log(`  URL: ${req.originalUrl}`);
+  // console.log(`  Headers: ${JSON.stringify(req.headers, null, 2)}`);
+  // console.log(`  Body: ${JSON.stringify(req.body, null, 2)}`);
 
 
   const authHeader = req.headers.authorization;
@@ -278,6 +364,9 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
         { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
       ],
       systemInstruction: geminiSystemInstruction,
+      tools: [
+        { googleSearch: {} },
+      ], 
     };
 
     // Handle reasoning_effort to set thinkingBudget
@@ -314,6 +403,8 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     
     const geminiResponse = result; 
 
+    console.log('Gemini API response:', JSON.stringify(geminiResponse, null, 2));
+
     if (!geminiResponse || !geminiResponse.candidates || geminiResponse.candidates.length === 0) {
       console.error('No response or candidates from Gemini API:', JSON.stringify(geminiResponse, null, 2));
       const blockReason = geminiResponse?.promptFeedback?.blockReason;
@@ -345,6 +436,34 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     const completionTokens = geminiResponse.usageMetadata?.candidatesTokenCount ?? (geminiResponse.usageMetadata as any)?.candidateTokenCount ?? 0;
     const totalTokens = geminiResponse.usageMetadata?.totalTokenCount ?? (promptTokens + completionTokens);
 
+    const groundingDataChunks = geminiResponse.candidates[0].groundingMetadata?.groundingChunks;
+
+    // === Add: Resolve real URLs for groundingChunks and add google_gemini_body ===
+    let googleGeminiBody: any = undefined;
+    if (groundingDataChunks && Array.isArray(groundingDataChunks)) {
+      // For each chunk, resolve the real URL and add as resolved_uri
+      const resolvedChunks = await Promise.all(
+        groundingDataChunks.map(async (chunk) => {
+          if (chunk.web && chunk.web.uri) {
+            const resolvedUri = await resolveRedirects(chunk.web.uri);
+            return {
+              ...chunk,
+              web: {
+                ...chunk.web,
+                resolved_uri: resolvedUri,
+              },
+            };
+          }
+          return chunk;
+        })
+      );
+      googleGeminiBody = {
+        groundingMetadata: {
+          groundingChunks: resolvedChunks,
+        },
+      };
+    }
+
     const openAIResponse: OpenAIChatCompletionResponse = {
       id: responseId,
       object: 'chat.completion',
@@ -358,6 +477,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
             content: fullText,
           },
           finish_reason: finishReason,
+          ...(googleGeminiBody ? { google_gemini_body: googleGeminiBody } : {}),
         },
       ],
       usage: {
