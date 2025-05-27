@@ -1,5 +1,4 @@
 import express, { Request, Response } from 'express';
-import https from 'https';
 import {
   GoogleGenAI,
   HarmCategory,
@@ -13,166 +12,12 @@ import {
   GenerateContentConfig,
 } from '@google/genai';
 
-import mime from 'mime';
+import { fetchFileAsBase64, fetchImageAsBase64, resolveRedirects } from './utils';
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(express.json());
-
-// Helper function to fetch image and convert to base64
-async function fetchImageAsBase64(imageUrl: string): Promise<{ base64Data: string; mimeType: string }> {
-  try {
-    const response = await fetch(imageUrl);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch image: ${response.status} ${response.statusText} from URL: ${imageUrl}`);
-    }
-    const imageBuffer = await response.arrayBuffer();
-    const base64Data = Buffer.from(imageBuffer).toString('base64');
-    
-    let detectedMimeType = response.headers.get('content-type');
-    if (!detectedMimeType || !detectedMimeType.startsWith('image/')) {
-      const typeFromUrl = mime.getType(imageUrl);
-      if (typeFromUrl && typeFromUrl.startsWith('image/')) {
-        detectedMimeType = typeFromUrl;
-      } else {
-        // Fallback or throw error if essential. Common types: image/jpeg, image/png, image/webp, etc.
-        // Gemini example used image/png. Let's default to jpeg if truly unknown.
-        console.warn(`Could not reliably determine MIME type for ${imageUrl}. Defaulting to image/jpeg.`);
-        detectedMimeType = 'image/jpeg'; 
-      }
-    }
-    return { base64Data, mimeType: detectedMimeType };
-  } catch (error) {
-    console.error(`Error fetching image ${imageUrl}:`, error);
-    throw error; // Re-throw to be handled by the main error handler
-  }
-}
-
-// Helper function to resolve a single redirect URL
-async function resolveRedirect(url: string): Promise<string> {
-  if (!url.startsWith('http://') && !url.startsWith('https://')) {
-    // console.warn(`Skipping redirect resolution for non-HTTP/S URL: ${url}`);
-    return url;
-  }
-  try {
-    const response = await fetch(url, { method: 'GET', redirect: 'follow' });
-    return response.url || url; // response.url should be the final URL after all redirects
-  } catch (error) {
-    console.error(`Error resolving redirect for ${url}:`, error);
-    return url; // Return original URL in case of an error
-  }
-}
-
-// Function to resolve redirects
-async function resolveRedirects(url: string, visitedUrls: Set<string> = new Set()): Promise<string> {
-  if (visitedUrls.has(url)) {
-    console.error(`Circular redirect detected for URL: ${url}`);
-    return url; // Avoid infinite loops
-  }
-  visitedUrls.add(url);
-
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(url);
-    const options = {
-      method: 'HEAD',
-      hostname: parsedUrl.hostname,
-      path: parsedUrl.pathname + parsedUrl.search,
-      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
-      headers: {
-        'User-Agent': 'Gemini-Reverse-Proxy/1.0' // It's good practice to set a User-Agent
-      }
-    };
-
-    const req = https.request(options, (res) => {
-      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        // Resolve relative redirects
-        const redirectUrl = new URL(res.headers.location, url).toString();
-        // Limit recursion depth if necessary, or rely on visitedUrls for cycles
-        if (visitedUrls.size > 10) { // Max 10 redirects
-            console.error(`Max redirects exceeded for URL: ${url}`);
-            resolve(url); // Return the last known URL before exceeding max redirects
-            return;
-        }
-        resolve(resolveRedirects(redirectUrl, visitedUrls));
-      } else if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-        resolve(url); // Final URL
-      } else {
-        console.error(`Failed to resolve URL: ${url}, Status: ${res.statusCode}`);
-        resolve(url); // Return original URL on error or non-redirect/success status
-      }
-    });
-
-    req.on('error', (e) => {
-      console.error(`Error resolving URL ${url}: ${e.message}`);
-      resolve(url); // Return original URL on request error
-    });
-
-    req.end();
-  });
-}
-
-// Helper function to process grounding chunks and add resolved URIs
-async function getResolvedGroundingChunks(groundingChunks: any[] | undefined): Promise<any[] | undefined> {
-  if (!groundingChunks) {
-    return undefined;
-  }
-  return Promise.all(
-    groundingChunks.map(async (chunk) => {
-      if (chunk.web && chunk.web.uri) {
-        const resolvedUri = await resolveRedirect(chunk.web.uri);
-        return {
-          ...chunk,
-          web: {
-            ...chunk.web,
-            resolved_uri: resolvedUri, // Adds a new field with the resolved URI
-          },
-        };
-      }
-      return chunk;
-    })
-  );
-}
-
-// Helper function to fetch audio and convert to base64
-async function fetchAudioAsBase64(audioUrl: string): Promise<{ base64Data: string; mimeType: string }> {
-  try {
-    const response = await fetch(audioUrl);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch audio: ${response.status} ${response.statusText} from URL: ${audioUrl}`);
-    }
-    const audioBuffer = await response.arrayBuffer();
-    const base64Data = Buffer.from(audioBuffer).toString('base64');
-    
-    let detectedMimeType = response.headers.get('content-type');
-    // Basic validation for audio MIME types
-    if (!detectedMimeType || !detectedMimeType.startsWith('audio/')) {
-      const typeFromUrl = mime.getType(audioUrl);
-      if (typeFromUrl && typeFromUrl.startsWith('audio/')) {
-        detectedMimeType = typeFromUrl;
-      } else {
-        console.warn(`Could not reliably determine MIME type for ${audioUrl}. Attempting to default based on extension or to a generic audio type.`);
-        // Attempt to infer from common audio extensions if mime.getType failed or was not specific enough
-        if (audioUrl.endsWith('.mp3')) detectedMimeType = 'audio/mpeg';
-        else if (audioUrl.endsWith('.wav')) detectedMimeType = 'audio/wav';
-        else if (audioUrl.endsWith('.ogg')) detectedMimeType = 'audio/ogg';
-        else if (audioUrl.endsWith('.m4a')) detectedMimeType = 'audio/mp4'; // m4a is often audio/mp4
-        else if (audioUrl.endsWith('.aac')) detectedMimeType = 'audio/aac';
-        else if (audioUrl.endsWith('.flac')) detectedMimeType = 'audio/flac';
-        else {
-            // Fallback to a generic audio type if still unknown, though Gemini might prefer more specific types
-            detectedMimeType = 'application/octet-stream'; // Or handle as an error
-             console.warn(`Using fallback MIME type ${detectedMimeType} for ${audioUrl}. Specific audio type preferred.`);
-        }
-      }
-    }
-    return { base64Data, mimeType: detectedMimeType };
-  } catch (error) {
-    console.error(`Error fetching audio ${audioUrl}:`, error);
-    throw error; // Re-throw to be handled by the main error handler
-  }
-}
-
 
 // Define new interfaces for OpenAI message content parts
 interface OpenAIContentTextPart {
@@ -188,14 +33,14 @@ interface OpenAIContentImageUrlPart {
   };
 }
 
-interface OpenAIContentAudioUrlPart {
-  type: 'audio_url';
-  audio_url: {
+interface OpenAIContentFileUrlPart {
+  type: 'file_url';
+  file_url: {
     url: string;
   };
 }
 
-type OpenAIContentPart = OpenAIContentTextPart | OpenAIContentImageUrlPart | OpenAIContentAudioUrlPart;
+type OpenAIContentPart = OpenAIContentTextPart | OpenAIContentImageUrlPart | OpenAIContentFileUrlPart;
 
 // Modify OpenAIMessage interface
 interface OpenAIMessage {
@@ -303,11 +148,9 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     const geminiContents: Content[] = [];
     for (const openAIMsg of openAIMessages) {
       if (openAIMsg.role === 'system') continue; // System message handled separately
-
       const currentGeminiParts: Part[] = [];
-      const mediaPartsForGemini: Part[] = []; // Combined for images and audio
+      const mediaPartsForGemini: Part[] = [];
       const textPartsForGemini: Part[] = [];
-
       if (typeof openAIMsg.content === 'string') {
         textPartsForGemini.push({ text: openAIMsg.content });
       } else { // Content is an array of OpenAIContentPart
@@ -323,19 +166,30 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
               res.status(400).json({ error: `Failed to process image from URL: ${part.image_url.url}. ${e.message}` });
               return;
             }
-          } else if (part.type === 'audio_url') {
-            try {
-              const { base64Data, mimeType } = await fetchAudioAsBase64(part.audio_url.url);
-              mediaPartsForGemini.push({ inlineData: { data: base64Data, mimeType: mimeType } });
-            } catch (e: any) {
-              console.error(`Failed to process audio URL ${part.audio_url.url}: ${e.message}`);
-              res.status(400).json({ error: `Failed to process audio from URL: ${part.audio_url.url}. ${e.message}` });
-              return;
+          } else if (part.type === 'file_url') {
+            const url = part.file_url.url;
+            const YOUTUBE_URL_REGEX = /^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{11})(?:[&?][^\s]*)?$/i;
+            if (YOUTUBE_URL_REGEX.test(url)) {
+              // YouTube link: use fileData with fileUri and video/* mimeType
+              mediaPartsForGemini.push({
+                fileData: {
+                  fileUri: url,
+                  mimeType: 'video/*',
+                }
+              });
+            } else {
+              try {
+                const { base64Data, mimeType } = await fetchFileAsBase64(url);
+                mediaPartsForGemini.push({ inlineData: { data: base64Data, mimeType: mimeType } });
+              } catch (e: any) {
+                console.error(`Failed to process file URL ${url}: ${e.message}`);
+                res.status(400).json({ error: `Failed to process file from URL: ${url}. ${e.message}` });
+                return;
+              }
             }
           }
         }
       }
-      
       // Add media parts first (images, audio), then text parts
       currentGeminiParts.push(...mediaPartsForGemini);
       currentGeminiParts.push(...textPartsForGemini);
