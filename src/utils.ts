@@ -114,8 +114,8 @@ export async function resolveRedirect(url: string): Promise<string> {
   }
 }
 
-// Function to resolve redirects
-export async function resolveRedirects(url: string, visitedUrls: Set<string> = new Set()): Promise<string> {
+// Function to resolve redirects with fallback for 403/405 errors
+export async function resolveRedirects(url: string, visitedUrls: Set<string> = new Set(), method: string = 'HEAD'): Promise<string> {
   if (visitedUrls.has(url)) {
     console.error(`Circular redirect detected for URL: ${url}`);
     return url; // Avoid infinite loops
@@ -125,12 +125,12 @@ export async function resolveRedirects(url: string, visitedUrls: Set<string> = n
   return new Promise((resolve, reject) => {
     const parsedUrl = new URL(url);
     const options = {
-      method: 'HEAD',
+      method: method,
       hostname: parsedUrl.hostname,
       path: parsedUrl.pathname + parsedUrl.search,
       port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
       headers: {
-        'User-Agent': 'Gemini-Reverse-Proxy/1.0' // It's good practice to set a User-Agent
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' // More common User-Agent
       }
     };
 
@@ -144,18 +144,35 @@ export async function resolveRedirects(url: string, visitedUrls: Set<string> = n
             resolve(url); // Return the last known URL before exceeding max redirects
             return;
         }
-        resolve(resolveRedirects(redirectUrl, visitedUrls));
+        resolve(resolveRedirects(redirectUrl, visitedUrls, method));
       } else if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
         resolve(url); // Final URL
+      } else if ((res.statusCode === 405 || res.statusCode === 403) && method === 'HEAD') {
+        // Try with GET method if HEAD failed with 405 (Method Not Allowed) or 403 (Forbidden)
+        console.warn(`${method} method failed with ${res.statusCode} for ${url}, trying GET method`);
+        // Remove from visitedUrls to allow retry with different method
+        visitedUrls.delete(url);
+        resolve(resolveRedirects(url, visitedUrls, 'GET'));
+      } else if (res.statusCode === 403 || res.statusCode === 405) {
+        // If GET also fails with 403/405, just return the original URL
+        console.warn(`Access denied or method not allowed for URL: ${url}, Status: ${res.statusCode}. Returning original URL.`);
+        resolve(url);
       } else {
         console.error(`Failed to resolve URL: ${url}, Status: ${res.statusCode}`);
-        resolve(url); // Return original URL on error or non-redirect/success status
+        resolve(url); // Return original URL on error or other non-redirect/success status
       }
     });
 
     req.on('error', (e) => {
       console.error(`Error resolving URL ${url}: ${e.message}`);
       resolve(url); // Return original URL on request error
+    });
+
+    // Set a timeout to avoid hanging requests
+    req.setTimeout(5000, () => {
+      console.warn(`Timeout resolving URL: ${url}. Returning original URL.`);
+      req.destroy();
+      resolve(url);
     });
 
     req.end();

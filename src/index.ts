@@ -13,88 +13,22 @@ import {
 } from '@google/genai';
 
 import { fetchFileAsBase64, fetchImageAsBase64, resolveRedirects } from './utils';
+import {
+  OpenAIContentTextPart,
+  OpenAIContentPart,
+  OpenAIMessage,
+  OpenAIChatCompletionRequest,
+  OpenAIChatCompletionResponse,
+  mapGeminiFinishReasonToOpenAI
+} from './types';
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(express.json());
 
-// Define new interfaces for OpenAI message content parts
-interface OpenAIContentTextPart {
-  type: 'text';
-  text: string;
-}
-
-interface OpenAIContentImageUrlPart {
-  type: 'image_url';
-  image_url: {
-    url: string;
-    // detail?: string; // Optional, not used by Gemini in this way
-  };
-}
-
-interface OpenAIContentFileUrlPart {
-  type: 'file_url';
-  file_url: {
-    url: string;
-  };
-}
-
-type OpenAIContentPart = OpenAIContentTextPart | OpenAIContentImageUrlPart | OpenAIContentFileUrlPart;
-
-// Modify OpenAIMessage interface
-interface OpenAIMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string | OpenAIContentPart[]; // Can be string or array of parts
-}
-
-interface OpenAIChatCompletionRequest {
-  model: string;
-  messages: OpenAIMessage[];
-  temperature?: number;
-  // stream?: boolean; // Not yet supported
-  // max_tokens?: number; // Not directly mapped, Gemini uses other limits
-  reasoning_effort?: 'low' | 'medium' | 'high' | 'none'; // Added reasoning_effort
-}
-
-interface OpenAIChatCompletionResponse {
-  id: string;
-  object: 'chat.completion';
-  created: number;
-  model: string;
-  choices: Array<{
-    index: number;
-    message: {
-      role: 'assistant';
-      content: string;
-    };
-    finish_reason: string;
-  }>;
-  usage: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
-}
-
-const mapGeminiFinishReasonToOpenAI = (reason: GeminiFinishReason | undefined): string => {
-  if (!reason) return 'stop';
-  switch (reason) {
-    case GeminiFinishReason.STOP:
-      return 'stop';
-    case GeminiFinishReason.MAX_TOKENS:
-      return 'length';
-    case GeminiFinishReason.SAFETY:
-      return 'content_filter';
-    case GeminiFinishReason.RECITATION:
-      return 'stop';
-    case GeminiFinishReason.OTHER:
-    default:
-      return 'stop';
-  }
-};
-
 app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<void> => {
+  // Log incoming request details for debugging purposes
   console.log(`[${new Date().toISOString()}] Incoming request:`);
   // console.log(`  Method: ${req.method}`);
   // console.log(`  URL: ${req.originalUrl}`);
@@ -103,7 +37,6 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
 
 
   const authHeader = req.headers.authorization;
-  // ... existing API key handling ...
   let apiKey: string | undefined;
 
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -117,7 +50,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
 
   try {
     const requestBody = req.body as OpenAIChatCompletionRequest;
-    const { model: modelName, messages: openAIMessages, temperature, reasoning_effort } = requestBody; // Added reasoning_effort
+    const { model: modelName, messages: openAIMessages, temperature, reasoning_effort, tools } = requestBody; // Added tools
 
     if (!modelName || !openAIMessages || !Array.isArray(openAIMessages)) {
       res.status(400).json({ error: 'Missing or invalid model or messages in request body' });
@@ -190,7 +123,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
           }
         }
       }
-      // Add media parts first (images, audio), then text parts
+      // Add media parts first (images, files), then text parts
       currentGeminiParts.push(...mediaPartsForGemini);
       currentGeminiParts.push(...textPartsForGemini);
 
@@ -209,7 +142,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
 
     // Use GenerateContentConfig for all configurations
     const geminiAPIConfig: GenerateContentConfig = {
-      temperature: temperature ?? 0.9,
+      temperature: temperature ?? 1,
       responseMimeType: 'text/plain',
       safetySettings: [ 
         { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
@@ -218,10 +151,12 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
         { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
       ],
       systemInstruction: geminiSystemInstruction,
-      tools: [
-        { googleSearch: {} },
-      ], 
     };
+
+    // Only add tools if provided in request
+    if (tools && tools.length > 0) {
+      geminiAPIConfig.tools = tools;
+    }
 
     // Handle reasoning_effort to set thinkingBudget
     let thinkingBudget = 0; // Default to 0 if not specified or "none"
