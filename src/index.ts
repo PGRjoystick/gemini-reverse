@@ -280,13 +280,57 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
 
   } catch (error: any) {
     console.error('Error processing request:', error.message, error.stack);
+    console.error('Error details:', {
+      name: error.name,
+      constructor: error.constructor?.name,
+      message: error.message,
+      status: error.status
+    });
+    
     let statusCode = 500;
     let errorMessage = 'Internal server error';
     let errorDetails = error.message;
 
-    if (error.name === 'GoogleGenerativeAIError' || error.constructor?.name === 'GoogleGenerativeAIError' || error.message?.includes('GoogleGenerativeAI')) { 
+    // Extract status code from Gemini API errors
+    if (error.name === 'GoogleGenerativeAIError' || error.constructor?.name === 'GoogleGenerativeAIError' || error.message?.includes('GoogleGenerativeAI') || error.message?.includes('got status:')) { 
         errorMessage = 'Error from Google Gemini API';
         errorDetails = error.message;
+        
+        // Try to extract status code from error message patterns
+        // Pattern 1: "got status: 429 Too Many Requests"
+        const statusMatch = error.message?.match(/got status:\s*(\d+)/);
+        console.log('Status match result:', statusMatch);
+        if (statusMatch) {
+            statusCode = parseInt(statusMatch[1], 10);
+            console.log('Extracted status code from Pattern 1:', statusCode);
+        } else {
+            // Pattern 2: Look for JSON with "code" field in the error message
+            const jsonMatch = error.message?.match(/\{"error":\{"code":(\d+),/);
+            console.log('JSON match result:', jsonMatch);
+            if (jsonMatch) {
+                statusCode = parseInt(jsonMatch[1], 10);
+                console.log('Extracted status code from Pattern 2:', statusCode);
+            } else {
+                // Pattern 3: Try to parse the entire JSON block if present
+                try {
+                    const jsonStart = error.message?.indexOf('{"error":');
+                    if (jsonStart !== -1) {
+                        const jsonStr = error.message.substring(jsonStart);
+                        const jsonEnd = jsonStr.lastIndexOf('}') + 1;
+                        const errorJson = JSON.parse(jsonStr.substring(0, jsonEnd));
+                        console.log('Parsed error JSON:', errorJson);
+                        if (errorJson.error && errorJson.error.code) {
+                            statusCode = errorJson.error.code;
+                            console.log('Extracted status code from Pattern 3:', statusCode);
+                        }
+                    }
+                } catch (parseError) {
+                    console.warn('Could not parse JSON from error message:', parseError);
+                }
+            }
+        }
+        
+        // Handle specific API key errors
         if (error.message?.toLowerCase().includes('api key not valid') || error.message?.toLowerCase().includes('api_key_invalid')) {
             statusCode = 401;
             errorMessage = 'Invalid Google Gemini API Key';
@@ -301,6 +345,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
         errorDetails = error.response.data;
     }
     
+    console.log('Final status code being returned:', statusCode);
     res.status(statusCode).json({ error: errorMessage, details: errorDetails });
   }
 });
