@@ -9,7 +9,11 @@
   },
   "dependencies": {
     "@google/genai": "^1.0.0",
-    "express": "^5.1.0"
+    "@types/dotenv": "^6.1.1",
+    "@types/mime": "^3.0.4",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "mime": "^4.0.7"
   },
   "devDependencies": {
     "@types/express": "^5.0.2",

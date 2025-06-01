@@ -1,17 +1,29 @@
 import https from 'https';
 import mime from 'mime';
+import dotenv from 'dotenv';
+
+// Load environment variables
+dotenv.config();
 
 // Helper function to transform URLs for local development
 export function transformUrlForLocal(url: string): string {
   try {
     const parsedUrl = new URL(url);
     
-    // Check if the hostname is bucket.joysky.id
-    if (parsedUrl.hostname === 'bucket.joysky.id') {
-      // Convert to localhost with http protocol
-      parsedUrl.hostname = 'localhost';
-      parsedUrl.port = '3003';
-      parsedUrl.protocol = 'http:';
+    // Get transformation settings from environment variables
+    const sourceHostname = process.env.TRANSFORM_SOURCE_HOSTNAME;
+    const targetHostname = process.env.TRANSFORM_TARGET_HOSTNAME || 'localhost';
+    const targetPort = process.env.TRANSFORM_TARGET_PORT;
+    const targetProtocol = process.env.TRANSFORM_TARGET_PROTOCOL || 'http:';
+    
+    // Only transform if source hostname is configured and matches
+    if (sourceHostname && parsedUrl.hostname === sourceHostname) {
+      // Convert to target hostname and protocol
+      parsedUrl.hostname = targetHostname;
+      if (targetPort) {
+        parsedUrl.port = targetPort;
+      }
+      parsedUrl.protocol = targetProtocol;
       console.log(`Transformed URL: ${url} -> ${parsedUrl.toString()}`);
       return parsedUrl.toString();
     }
@@ -44,7 +56,7 @@ export async function fetchFileAsBase64(fileUrl: string): Promise<{ base64Data: 
       detectedMimeType = getMimeTypeFromBase64(base64Data);
     }
   }
-  return { base64Data, mimeType: detectedMimeType };
+  return { base64Data, mimeType: detectedMimeType || 'application/octet-stream' };
 }
 
 // Helper function to fetch image and convert to base64
@@ -70,8 +82,7 @@ export async function fetchImageAsBase64(imageUrl: string): Promise<{ base64Data
         detectedMimeType = 'image/jpeg'; 
       }
     }
-    return { base64Data,
-       mimeType: detectedMimeType };
+    return { base64Data, mimeType: detectedMimeType || 'image/jpeg' };
   } catch (error) {
     console.error(`Error fetching image ${imageUrl}:`, error);
     throw error; // Re-throw to be handled by the main error handler
@@ -260,7 +271,7 @@ export async function fetchAudioAsBase64(audioUrl: string): Promise<{ base64Data
         }
       }
     }
-    return { base64Data, mimeType: detectedMimeType };
+    return { base64Data, mimeType: detectedMimeType || 'application/octet-stream' };
   } catch (error) {
     console.error(`Error fetching audio ${audioUrl}:`, error);
     throw error; // Re-throw to be handled by the main error handler
