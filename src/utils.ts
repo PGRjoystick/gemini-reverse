@@ -1,10 +1,57 @@
 import https from 'https';
 import mime from 'mime';
 
+// Helper function to transform URLs for local development
+export function transformUrlForLocal(url: string): string {
+  try {
+    const parsedUrl = new URL(url);
+    
+    // Check if the hostname is bucket.joysky.id
+    if (parsedUrl.hostname === 'bucket.joysky.id') {
+      // Convert to localhost with http protocol
+      parsedUrl.hostname = 'localhost';
+      parsedUrl.port = '3003';
+      parsedUrl.protocol = 'http:';
+      console.log(`Transformed URL: ${url} -> ${parsedUrl.toString()}`);
+      return parsedUrl.toString();
+    }
+    
+    // Return original URL if no transformation needed
+    return url;
+  } catch (error) {
+    console.warn(`Failed to parse URL for transformation: ${url}`, error);
+    return url; // Return original URL if parsing fails
+  }
+}
+
+// Helper function to fetch file and convert to base64
+export async function fetchFileAsBase64(fileUrl: string): Promise<{ base64Data: string; mimeType: string }> {
+  const transformedUrl = transformUrlForLocal(fileUrl);
+  const response = await fetch(transformedUrl);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch file: ${response.status} ${response.statusText} from URL: ${fileUrl}`);
+  }
+  const fileBuffer = await response.arrayBuffer();
+  const base64Data = Buffer.from(fileBuffer).toString('base64');
+  let detectedMimeType = response.headers.get('content-type');
+  if (!detectedMimeType) {
+    // Try mime package
+    const typeFromUrl = mime.getType(fileUrl);
+    if (typeFromUrl) {
+      detectedMimeType = typeFromUrl;
+    } else {
+      // Fallback to magic number detection
+      detectedMimeType = getMimeTypeFromBase64(base64Data);
+    }
+  }
+  return { base64Data, mimeType: detectedMimeType };
+}
+
 // Helper function to fetch image and convert to base64
 export async function fetchImageAsBase64(imageUrl: string): Promise<{ base64Data: string; mimeType: string }> {
   try {
-    const response = await fetch(imageUrl);
+    const transformedUrl = transformUrlForLocal(imageUrl);
+    const response = await fetch(transformedUrl);
     if (!response.ok) {
       throw new Error(`Failed to fetch image: ${response.status} ${response.statusText} from URL: ${imageUrl}`);
     }
@@ -23,7 +70,8 @@ export async function fetchImageAsBase64(imageUrl: string): Promise<{ base64Data
         detectedMimeType = 'image/jpeg'; 
       }
     }
-    return { base64Data, mimeType: detectedMimeType };
+    return { base64Data,
+       mimeType: detectedMimeType };
   } catch (error) {
     console.error(`Error fetching image ${imageUrl}:`, error);
     throw error; // Re-throw to be handled by the main error handler
@@ -75,28 +123,6 @@ export function getMimeTypeFromBase64(base64Data: string): string {
   }
   // Default fallback
   return 'application/octet-stream';
-}
-
-// Helper function to fetch file and convert to base64
-export async function fetchFileAsBase64(fileUrl: string): Promise<{ base64Data: string; mimeType: string }> {
-  const response = await fetch(fileUrl);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch file: ${response.status} ${response.statusText} from URL: ${fileUrl}`);
-  }
-  const fileBuffer = await response.arrayBuffer();
-  const base64Data = Buffer.from(fileBuffer).toString('base64');
-  let detectedMimeType = response.headers.get('content-type');
-  if (!detectedMimeType) {
-    // Try mime package
-    const typeFromUrl = mime.getType(fileUrl);
-    if (typeFromUrl) {
-      detectedMimeType = typeFromUrl;
-    } else {
-      // Fallback to magic number detection
-      detectedMimeType = getMimeTypeFromBase64(base64Data);
-    }
-  }
-  return { base64Data, mimeType: detectedMimeType };
 }
 
 // Helper function to resolve a single redirect URL
@@ -204,7 +230,8 @@ export async function getResolvedGroundingChunks(groundingChunks: any[] | undefi
 // Helper function to fetch audio and convert to base64
 export async function fetchAudioAsBase64(audioUrl: string): Promise<{ base64Data: string; mimeType: string }> {
   try {
-    const response = await fetch(audioUrl);
+    const transformedUrl = transformUrlForLocal(audioUrl);
+    const response = await fetch(transformedUrl);
     if (!response.ok) {
       throw new Error(`Failed to fetch audio: ${response.status} ${response.statusText} from URL: ${audioUrl}`);
     }
