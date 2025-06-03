@@ -5,17 +5,24 @@
   "author": "PGRjoystick",
   "main": "src/index.ts",
   "scripts": {
-    "dev": "vite-node src/index.ts"
+    "dev": "vite-node src/index.ts",
+    "test:image-gen": "node test-image-generation.js",
+    "test:mixed-content": "node test-mixed-content.js",
+    "test:comprehensive": "node test-comprehensive.js"
   },
   "dependencies": {
     "@google/genai": "^1.0.0",
     "@types/dotenv": "^6.1.1",
+    "@types/form-data": "^2.2.1",
     "@types/mime": "^3.0.4",
+    "axios": "^1.9.0",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
+    "form-data": "^4.0.2",
     "mime": "^4.0.7"
   },
   "devDependencies": {
+    "@types/axios": "^0.9.36",
     "@types/express": "^5.0.2",
     "@types/node": "^22.15.21",
     "typescript": "^5.8.3",

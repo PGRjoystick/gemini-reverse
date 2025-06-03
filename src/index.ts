@@ -12,7 +12,7 @@ import {
   GenerateContentConfig,
 } from '@google/genai';
 
-import { fetchFileAsBase64, fetchImageAsBase64, resolveRedirects } from './utils';
+import { fetchFileAsBase64, fetchImageAsBase64, resolveRedirects, processGeminiResponseParts, isGeminiImagePart, checkBucketServerHealth } from './utils';
 import {
   OpenAIContentTextPart,
   OpenAIContentPart,
@@ -33,7 +33,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
   // console.log(`  Method: ${req.method}`);
   // console.log(`  URL: ${req.originalUrl}`);
   // console.log(`  Headers: ${JSON.stringify(req.headers, null, 2)}`);
-  // console.log(`  Body: ${JSON.stringify(req.body, null, 2)}`);
+   console.log(`  Body: ${JSON.stringify(req.body, null, 2)}`);
 
 
   const authHeader = req.headers.authorization;
@@ -41,16 +41,21 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
 
   if (authHeader && authHeader.startsWith('Bearer ')) {
     apiKey = authHeader.substring(7);
+  } else {
+    // Fallback to environment variable if no Authorization header
+    apiKey = process.env.GEMINI_API_KEY;
   }
 
   if (!apiKey) {
-    res.status(401).json({ error: 'API key not provided or invalid format. Use Bearer token in Authorization header.' });
+    res.status(401).json({ 
+      error: 'API key not provided. Use Bearer token in Authorization header or set GEMINI_API_KEY environment variable.' 
+    });
     return;
   }
 
   try {
     const requestBody = req.body as OpenAIChatCompletionRequest;
-    const { model: modelName, messages: openAIMessages, temperature, reasoning_effort, tools } = requestBody; // Added tools
+    const { model: modelName, messages: openAIMessages, temperature, reasoning_effort, tools, modalities } = requestBody; // Added tools and modalities
 
     if (!modelName || !openAIMessages || !Array.isArray(openAIMessages)) {
       res.status(400).json({ error: 'Missing or invalid model or messages in request body' });
@@ -158,9 +163,32 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
       geminiAPIConfig.tools = tools;
     }
 
+    // Handle modalities parameter to set responseModalities
+    if (modalities && Array.isArray(modalities) && modalities.length > 0) {
+      const responseModalities: string[] = [];
+      
+      for (const modality of modalities) {
+        if (typeof modality === 'string') {
+          const upperModality = modality.toUpperCase();
+          if (upperModality === 'TEXT') {
+            responseModalities.push('TEXT');
+          } else if (upperModality === 'IMAGE') {
+            responseModalities.push('IMAGE');
+          } else {
+            console.warn(`Unsupported modality: ${modality}. Supported modalities are 'text' and 'image'.`);
+          }
+        }
+      }
+      
+      if (responseModalities.length > 0) {
+        geminiAPIConfig.responseModalities = responseModalities;
+      }
+    }
+
     // Handle reasoning_effort to set thinkingBudget
-    let thinkingBudget = 0; // Default to 0 if not specified or "none"
+    // Only add thinkingConfig if reasoning_effort parameter is explicitly provided
     if (reasoning_effort) {
+      let thinkingBudget = 0; // Default to 0 for "none" or invalid values
       switch (reasoning_effort) {
         case 'low':
           thinkingBudget = 1000;
@@ -179,10 +207,9 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
           console.warn(`Invalid reasoning_effort value: ${reasoning_effort}. Defaulting to thinking budget 0.`);
           break;
       }
+      geminiAPIConfig.thinkingConfig = { thinkingBudget: thinkingBudget };
     }
-    // Only add thinkingConfig if budget is explicitly set by reasoning_effort or if it was the previous default
-    // The previous default was to always add thinkingBudget: 0. We will maintain this if no reasoning_effort is given.
-    geminiAPIConfig.thinkingConfig = { thinkingBudget: thinkingBudget };
+    // If reasoning_effort is not provided, thinkingConfig is not set at all
 
     const result: GenerateContentResponse = await genAI.models.generateContent({
         model: modelName,
@@ -212,9 +239,32 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     }
 
     const candidate = geminiResponse.candidates[0];
-    const fullText = (candidate.content && candidate.content.parts && candidate.content.parts.length > 0)
-        ? candidate.content.parts.map((part: Part) => part.text).join('') // Note: if model returns mixed content, this only gets text
+    
+    // Check if response contains mixed content (text + images)
+    const hasMixedContent = candidate.content?.parts?.some((part: Part) => isGeminiImagePart(part));
+    
+    console.log(`Response analysis: ${candidate.content?.parts?.length || 0} parts, mixed content: ${hasMixedContent}`);
+    if (hasMixedContent) {
+      console.log('Parts breakdown:', candidate.content?.parts?.map((part, i) => ({
+        index: i,
+        hasText: !!part.text,
+        hasImage: isGeminiImagePart(part),
+        imageType: isGeminiImagePart(part) ? (part as any).inlineData?.mimeType : null
+      })));
+    }
+    
+    let responseContent: string | OpenAIContentPart[];
+    
+    if (hasMixedContent && candidate.content?.parts) {
+      // Process mixed content with images
+      console.log('Processing mixed content response with images');
+      responseContent = await processGeminiResponseParts(candidate.content.parts);
+    } else {
+      // Traditional text-only response
+      responseContent = (candidate.content && candidate.content.parts && candidate.content.parts.length > 0)
+        ? candidate.content.parts.map((part: Part) => part.text).filter(Boolean).join('')
         : '';
+    }
 
     const finishReason = mapGeminiFinishReasonToOpenAI(candidate.finishReason);
 
@@ -263,7 +313,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
           index: 0,
           message: {
             role: 'assistant',
-            content: fullText,
+            content: responseContent,
           },
           finish_reason: finishReason,
           ...(googleGeminiBody ? { google_gemini_body: googleGeminiBody } : {}),
@@ -350,6 +400,15 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
   }
 });
 
-app.listen(port, () => {
+app.listen(port, async () => {
   console.log('Reverse proxy server listening on http://localhost:' + port);
+  
+  // Check bucket server health on startup
+  console.log('Checking bucket server availability...');
+  const bucketHealthy = await checkBucketServerHealth();
+  if (bucketHealthy) {
+    console.log('✓ Bucket server is available for image uploads');
+  } else {
+    console.log('⚠ Bucket server not available - image uploads will fall back to data URLs');
+  }
 });

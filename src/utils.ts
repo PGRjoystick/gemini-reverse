@@ -1,6 +1,9 @@
 import https from 'https';
 import mime from 'mime';
 import dotenv from 'dotenv';
+import FormData from 'form-data';
+import axios from 'axios';
+import { OpenAIContentPart } from './types';
 
 // Load environment variables
 dotenv.config();
@@ -275,5 +278,202 @@ export async function fetchAudioAsBase64(audioUrl: string): Promise<{ base64Data
   } catch (error) {
     console.error(`Error fetching audio ${audioUrl}:`, error);
     throw error; // Re-throw to be handled by the main error handler
+  }
+}
+
+// Helper function to upload base64 image to bucket server
+export async function uploadImageToBucket(base64Data: string, mimeType: string, filename?: string): Promise<string> {
+  try {
+    // Determine file extension from MIME type
+    const extension = getExtensionFromMimeType(mimeType);
+    const finalFilename = filename || `generated-image-${Date.now()}${extension}`;
+    
+    // Create form data for upload
+    const formData = new FormData();
+    
+    // Convert base64 to buffer
+    const binaryData = Buffer.from(base64Data, 'base64');
+    
+    // Append the buffer as a file to form data
+    formData.append('file', binaryData, {
+      filename: finalFilename,
+      contentType: mimeType,
+    });
+    
+    // Get bucket server configuration from environment variables
+    const bucketApiUrl = process.env.BUCKET_API_URL;
+    const bucketApiKey = process.env.BUCKET_API_KEY;
+    
+    // Build upload URL
+    let bucketUrl: string;
+    if (bucketApiUrl) {
+      // Use the direct API URL if provided (should already include /upload endpoint)
+      bucketUrl = bucketApiUrl;
+    } else {
+      // Fallback to legacy environment variables and construct upload endpoint
+      const bucketProtocol = process.env.TRANSFORM_TARGET_PROTOCOL || 'http:';
+      const bucketHostname = process.env.TRANSFORM_TARGET_HOSTNAME || 'localhost';
+      const bucketPort = process.env.TRANSFORM_TARGET_PORT || '3003';
+      bucketUrl = `${bucketProtocol}//${bucketHostname}:${bucketPort}/upload`;
+    }
+    
+    // Ensure the URL ends with /upload if not already present
+    if (!bucketUrl.endsWith('/upload')) {
+      bucketUrl = bucketUrl.replace(/\/$/, '') + '/upload';
+    }
+    
+    console.log(`Uploading image to bucket server: ${bucketUrl}`);
+    
+    // Prepare headers
+    const headers = formData.getHeaders();
+    if (bucketApiKey) {
+      headers['x-api-key'] = bucketApiKey;
+    }
+    
+    // Use axios with form-data
+    const response = await axios.post(bucketUrl, formData, {
+      headers: headers,
+    });
+    
+    const result = response.data as any;
+    
+    console.log('Bucket server response:', JSON.stringify(result, null, 2));
+    console.log('Response status:', response.status);
+    console.log('Response headers:', response.headers);
+    
+    // Check for different possible response formats
+    if (result && result.fileUrl) {
+      // Format: {message: "...", fileUrl: "..."}
+      console.log(`Image uploaded successfully: ${result.fileUrl}`);
+      return result.fileUrl;
+    } else if (result && result.success === true && result.url) {
+      // Format: {success: true, url: "..."}
+      console.log(`Image uploaded successfully: ${result.url}`);
+      return result.url;
+    } else if (result && result.url) {
+      // Format: {url: "..."}
+      console.log(`Image uploaded successfully (no success field): ${result.url}`);
+      return result.url;
+    } else if (typeof result === 'string' && result.startsWith('http')) {
+      // Format: "http://..."
+      console.log(`Image uploaded successfully (URL string): ${result}`);
+      return result;
+    } else {
+      throw new Error(`Bucket server upload failed: ${result?.error || result?.message || 'Unknown response format'}`);
+    }
+    
+  } catch (error: any) {
+    // Handle axios errors
+    if (error.response) {
+      // Axios error with response
+      const statusCode = error.response.status || 'Unknown';
+      const statusText = error.response.statusText || 'Unknown Error';
+      const errorData = error.response.data;
+      const errorMessage = typeof errorData === 'object' ? JSON.stringify(errorData) : errorData;
+      console.error('Error uploading image to bucket:', `${statusCode} ${statusText} - ${errorMessage}`);
+      throw new Error(`Failed to upload image to bucket: ${statusCode} ${statusText} - ${errorMessage}`);
+    } else {
+      console.error('Error uploading image to bucket:', error);
+      throw error;
+    }
+  }
+}
+
+// Helper function to get file extension from MIME type
+export function getExtensionFromMimeType(mimeType: string): string {
+  const extensions: Record<string, string> = {
+    'image/jpeg': '.jpg',
+    'image/jpg': '.jpg',
+    'image/png': '.png',
+    'image/gif': '.gif',
+    'image/webp': '.webp',
+    'image/bmp': '.bmp',
+    'image/svg+xml': '.svg',
+    'image/tiff': '.tiff',
+    'image/x-icon': '.ico',
+  };
+  
+  return extensions[mimeType.toLowerCase()] || '.jpg'; // Default to .jpg
+}
+
+// Helper function to check if a Gemini response part contains an image
+export function isGeminiImagePart(part: any): boolean {
+  return part?.inlineData?.mimeType?.startsWith('image/') && part?.inlineData?.data;
+}
+
+// Helper function to process Gemini response parts and upload images
+export async function processGeminiResponseParts(parts: any[]): Promise<OpenAIContentPart[]> {
+  const processedParts: OpenAIContentPart[] = [];
+  
+  for (const part of parts) {
+    if (isGeminiImagePart(part)) {
+      try {
+        // Upload the base64 image to bucket server (with fallback)
+        const imageUrl = await uploadImageToBucketWithFallback(
+          part.inlineData.data,
+          part.inlineData.mimeType
+        );
+        
+        // Add as OpenAI image_url content part
+        processedParts.push({
+          type: 'image_url',
+          image_url: {
+            url: imageUrl,
+          },
+        });
+        
+        console.log(`Successfully processed image part: ${imageUrl.startsWith('data:') ? 'data URL' : 'uploaded URL'}`);
+      } catch (error) {
+        console.error('Failed to process image part:', error);
+        // Add error message as text part
+        processedParts.push({
+          type: 'text',
+          text: `[Image processing failed: ${error instanceof Error ? error.message : 'Unknown error'}]`,
+        });
+      }
+    } else if (part.text) {
+      // Add text content part
+      processedParts.push({
+        type: 'text',
+        text: part.text,
+      });
+    }
+  }
+  
+  return processedParts;
+}
+
+// Helper function to check if bucket server is available
+export async function checkBucketServerHealth(): Promise<boolean> {
+  try {
+    // Simple check - just verify the bucket server responds at the base URL
+    const bucketProtocol = process.env.TRANSFORM_TARGET_PROTOCOL || 'http:';
+    const bucketHostname = process.env.TRANSFORM_TARGET_HOSTNAME || 'localhost';
+    const bucketPort = process.env.TRANSFORM_TARGET_PORT || '3003';
+    
+    const bucketUrl = `${bucketProtocol}//${bucketHostname}:${bucketPort}`;
+    
+    const response = await fetch(bucketUrl, {
+      method: 'GET',
+      headers: { 'User-Agent': 'gemini-reverse-proxy' }
+    });
+    
+    // Check if server responds with any successful status
+    return response.ok;
+  } catch (error) {
+    console.warn('Bucket server health check failed:', error instanceof Error ? error.message : error);
+    return false;
+  }
+}
+
+// Enhanced image upload with fallback handling
+export async function uploadImageToBucketWithFallback(base64Data: string, mimeType: string, filename?: string): Promise<string> {
+  try {
+    return await uploadImageToBucket(base64Data, mimeType, filename);
+  } catch (uploadError) {
+    console.warn('Image upload failed, falling back to data URL:', uploadError instanceof Error ? uploadError.message : uploadError);
+    
+    // Fallback: return data URL (not ideal for production but useful for testing)
+    return `data:${mimeType};base64,${base64Data}`;
   }
 }
