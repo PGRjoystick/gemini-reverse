@@ -232,17 +232,31 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
       temperature: temperature ?? 1,
       responseMimeType: 'text/plain',
       safetySettings: [ 
-        { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-        { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.OFF },
+        { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.OFF },
+        { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.OFF },
+        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.OFF },
       ],
       systemInstruction: geminiSystemInstruction,
     };
 
-    // Only add tools if provided in request
-    if (tools && tools.length > 0) {
-      geminiAPIConfig.tools = tools;
+    // Only add tools if provided in request, filtering out invalid/empty tools
+    if (tools && Array.isArray(tools) && tools.length > 0) {
+      // Filter out empty objects or tools without a valid tool_type
+      const validTools = tools.filter(tool => {
+        if (!tool || typeof tool !== 'object') return false;
+        // A valid tool must have at least one property (googleSearch, codeExecution, functionDeclarations, etc.)
+        const hasValidProperty = Object.keys(tool).length > 0 && 
+          Object.values(tool).some(v => v !== undefined && v !== null);
+        return hasValidProperty;
+      });
+      
+      if (validTools.length > 0) {
+        console.log(`  Tools: ${validTools.length} valid tools (filtered from ${tools.length})`);
+        geminiAPIConfig.tools = validTools;
+      } else {
+        console.log(`  Tools: All ${tools.length} tools were invalid/empty, skipping tools parameter`);
+      }
     }
 
     // Handle modalities parameter to set responseModalities
