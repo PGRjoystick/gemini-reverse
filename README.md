@@ -71,6 +71,34 @@ The reverse proxy supports these OpenAI-compatible parameters:
 - `tools`: Array of tools (currently supports Google Search)
 - `modalities`: Output modalities (`["text"]`, `["image"]`, or `["text", "image"]`)
 
+### Vertex AI Support
+
+The server supports both Google Gemini AI (default) and Google Cloud Vertex AI modes. To use Vertex AI, include these parameters in your request body:
+
+- `use_vertex`: Set to `true` to use Vertex AI instead of Gemini AI
+- `google_cloud_project`: Your Google Cloud project ID (required when `use_vertex` is `true`)
+- `google_cloud_location`: The Google Cloud region (required when `use_vertex` is `true`, e.g., `us-central1`, `global`)
+
+**Example Vertex AI Request:**
+
+```json
+{
+  "model": "gemini-1.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello!"
+    }
+  ],
+  "use_vertex": true,
+  "google_cloud_project": "my-gcp-project",
+  "google_cloud_location": "us-central1"
+}
+```
+
+**Authentication for Vertex AI:**
+When using Vertex AI mode, you still need to provide an API key via the `Authorization: Bearer` header. This key should be your Google Cloud API key or service account credentials with appropriate Vertex AI permissions.
+
 ### Modalities Support
 
 When requesting mixed content generation, specify the desired output modalities:

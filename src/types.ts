@@ -38,6 +38,10 @@ export interface OpenAIChatCompletionRequest {
   reasoning_effort?: 'low' | 'medium' | 'high' | 'none'; // Added reasoning_effort
   tools?: Array<{ googleSearch?: {} }>; // Added tools support
   modalities?: string[]; // Added modalities support for mixed content generation
+  // Vertex AI configuration
+  use_vertex?: boolean; // If true, use Google Cloud Vertex AI instead of Gemini AI
+  google_cloud_project?: string; // Required when use_vertex is true
+  google_cloud_location?: string; // Required when use_vertex is true (e.g., 'us-central1', 'global')
 }
 
 export interface OpenAIChatCompletionResponse {

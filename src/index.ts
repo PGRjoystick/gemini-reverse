@@ -88,14 +88,56 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
 
   try {
     const requestBody = req.body as OpenAIChatCompletionRequest;
-    const { model: modelName, messages: openAIMessages, temperature, reasoning_effort, tools, modalities } = requestBody; // Added tools and modalities
+    const { 
+      model: modelName, 
+      messages: openAIMessages, 
+      temperature, 
+      reasoning_effort, 
+      tools, 
+      modalities,
+      use_vertex,
+      google_cloud_project,
+      google_cloud_location
+    } = requestBody;
 
     if (!modelName || !openAIMessages || !Array.isArray(openAIMessages)) {
       res.status(400).json({ error: 'Missing or invalid model or messages in request body' });
       return;
     }
 
-    const genAI = new GoogleGenAI({ apiKey });
+    // Validate Vertex AI configuration if use_vertex is true
+    if (use_vertex) {
+      if (!google_cloud_project) {
+        res.status(400).json({ 
+          error: 'Missing google_cloud_project. When use_vertex is true, google_cloud_project is required.' 
+        });
+        return;
+      }
+      if (!google_cloud_location) {
+        res.status(400).json({ 
+          error: 'Missing google_cloud_location. When use_vertex is true, google_cloud_location is required.' 
+        });
+        return;
+      }
+      console.log(`  Using Vertex AI mode:`);
+      console.log(`    Project: ${google_cloud_project}`);
+      console.log(`    Location: ${google_cloud_location}`);
+    }
+
+    // Initialize GoogleGenAI with appropriate configuration
+    let genAI: GoogleGenAI;
+    if (use_vertex) {
+      // Vertex AI mode: use project and location from request body
+      genAI = new GoogleGenAI({
+        apiKey: apiKey, // API key is still used for authentication
+        vertexai: true,
+        project: google_cloud_project,
+        location: google_cloud_location,
+      });
+    } else {
+      // Standard Gemini AI mode
+      genAI = new GoogleGenAI({ apiKey });
+    }
 
     const systemMessage = openAIMessages.find(msg => msg.role === 'system');
     let geminiSystemInstruction: Content | undefined = undefined;
