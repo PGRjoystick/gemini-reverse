@@ -97,7 +97,21 @@ The server supports both Google Gemini AI (default) and Google Cloud Vertex AI m
 ```
 
 **Authentication for Vertex AI:**
-When using Vertex AI mode, you still need to provide an API key via the `Authorization: Bearer` header. This key should be your Google Cloud API key or service account credentials with appropriate Vertex AI permissions.
+When using Vertex AI mode, authentication is handled via **Google Cloud Application Default Credentials (ADC)** on the server, not via the API key in the request. The server must have valid Google Cloud credentials configured.
+
+**Setting up server credentials for Vertex AI:**
+
+Option 1 - User credentials (for development):
+```bash
+gcloud auth application-default login
+```
+
+Option 2 - Service account (for production):
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account-key.json"
+```
+
+The service account needs the `Vertex AI User` role (`roles/aiplatform.user`) or equivalent permissions.
 
 ### Modalities Support
 

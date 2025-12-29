@@ -68,6 +68,8 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     console.log(`  Modalities: ${JSON.stringify(req.body.modalities)}`);
   }
 
+  // Check if using Vertex AI mode (need to peek at request body)
+  const useVertexAI = req.body.use_vertex === true;
 
   const authHeader = req.headers.authorization;
   let apiKey: string | undefined;
@@ -79,7 +81,9 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     apiKey = process.env.GEMINI_API_KEY;
   }
 
-  if (!apiKey) {
+  // API key is only required for non-Vertex AI mode
+  // Vertex AI uses Application Default Credentials (ADC) for authentication
+  if (!apiKey && !useVertexAI) {
     res.status(401).json({ 
       error: 'API key not provided. Use Bearer token in Authorization header or set GEMINI_API_KEY environment variable.' 
     });
@@ -125,11 +129,14 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     }
 
     // Initialize GoogleGenAI with appropriate configuration
+    // Note: Vertex AI and API key are mutually exclusive
+    // - For Vertex AI: Uses Google Cloud credentials (ADC) for authentication
+    // - For Gemini AI: Uses API key for authentication
     let genAI: GoogleGenAI;
     if (use_vertex) {
-      // Vertex AI mode: use project and location from request body
+      // Vertex AI mode: use project and location, authentication via ADC (Application Default Credentials)
+      // API key must NOT be provided when using Vertex AI
       genAI = new GoogleGenAI({
-        apiKey: apiKey, // API key is still used for authentication
         vertexai: true,
         project: google_cloud_project,
         location: google_cloud_location,
