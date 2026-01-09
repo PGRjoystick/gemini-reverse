@@ -36,6 +36,7 @@ export interface OpenAIChatCompletionRequest {
   // stream?: boolean; // Not yet supported
   // max_tokens?: number; // Not directly mapped, Gemini uses other limits
   reasoning_effort?: 'low' | 'medium' | 'high' | 'none'; // Added reasoning_effort
+  thinking_level?: 'minimal' | 'low' | 'medium' | 'high'; // Added thinking_level
   tools?: Array<{ googleSearch?: {} }>; // Added tools support
   modalities?: string[]; // Added modalities support for mixed content generation
   // Vertex AI configuration

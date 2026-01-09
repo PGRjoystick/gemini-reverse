@@ -10,6 +10,7 @@ import {
   GenerateContentResponse,
   SafetySetting,
   GenerateContentConfig,
+  ThinkingLevel,
 } from '@google/genai';
 
 import { fetchFileAsBase64, fetchImageAsBase64, resolveRedirects, processGeminiResponseParts, isGeminiImagePart, checkBucketServerHealth } from './utils';
@@ -96,7 +97,8 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
       model: modelName, 
       messages: openAIMessages, 
       temperature, 
-      reasoning_effort, 
+      reasoning_effort,
+      thinking_level,
       tools, 
       modalities,
       use_vertex,
@@ -281,31 +283,59 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
       }
     }
 
-    // Handle reasoning_effort to set thinkingBudget
-    // Only add thinkingConfig if reasoning_effort parameter is explicitly provided
-    if (reasoning_effort) {
-      let thinkingBudget = 0; // Default to 0 for "none" or invalid values
-      switch (reasoning_effort) {
-        case 'low':
-          thinkingBudget = 1000;
-          break;
-        case 'medium':
-          thinkingBudget = 8000;
-          break;
-        case 'high':
-          thinkingBudget = 24000;
-          break;
-        case 'none':
-          thinkingBudget = 0;
-          break;
-        default:
-          // Log invalid value but proceed with default 0
-          console.warn(`Invalid reasoning_effort value: ${reasoning_effort}. Defaulting to thinking budget 0.`);
-          break;
+    // Handle reasoning_effort and thinking_level to set thinkingConfig
+    // Only add thinkingConfig if reasoning_effort or thinking_level parameter is explicitly provided
+    if (reasoning_effort || thinking_level) {
+      const thinkingConfig: { thinkingBudget?: number; thinkingLevel?: ThinkingLevel } = {};
+      
+      // Handle reasoning_effort to set thinkingBudget
+      if (reasoning_effort) {
+        let thinkingBudget = 0; // Default to 0 for "none" or invalid values
+        switch (reasoning_effort) {
+          case 'low':
+            thinkingBudget = 1000;
+            break;
+          case 'medium':
+            thinkingBudget = 8000;
+            break;
+          case 'high':
+            thinkingBudget = 24000;
+            break;
+          case 'none':
+            thinkingBudget = 0;
+            break;
+          default:
+            // Log invalid value but proceed with default 0
+            console.warn(`Invalid reasoning_effort value: ${reasoning_effort}. Defaulting to thinking budget 0.`);
+            break;
+        }
+        thinkingConfig.thinkingBudget = thinkingBudget;
       }
-      geminiAPIConfig.thinkingConfig = { thinkingBudget: thinkingBudget };
+      
+      // Handle thinking_level to set thinkingLevel
+      if (thinking_level) {
+        switch (thinking_level) {
+          case 'minimal':
+            thinkingConfig.thinkingLevel = ThinkingLevel.MINIMAL;
+            break;
+          case 'low':
+            thinkingConfig.thinkingLevel = ThinkingLevel.LOW;
+            break;
+          case 'medium':
+            thinkingConfig.thinkingLevel = ThinkingLevel.MEDIUM;
+            break;
+          case 'high':
+            thinkingConfig.thinkingLevel = ThinkingLevel.HIGH;
+            break;
+          default:
+            console.warn(`Invalid thinking_level value: ${thinking_level}. Supported values are 'minimal', 'low', 'medium', 'high'.`);
+            break;
+        }
+      }
+      
+      geminiAPIConfig.thinkingConfig = thinkingConfig;
     }
-    // If reasoning_effort is not provided, thinkingConfig is not set at all
+    // If neither reasoning_effort nor thinking_level is provided, thinkingConfig is not set at all
 
     const result: GenerateContentResponse = await genAI.models.generateContent({
         model: modelName,
