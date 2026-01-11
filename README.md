@@ -99,6 +99,120 @@ The server supports both Google Gemini AI (default) and Google Cloud Vertex AI m
 **Authentication for Vertex AI:**
 When using Vertex AI mode, authentication is handled via **Google Cloud Application Default Credentials (ADC)** on the server, not via the API key in the request. The server must have valid Google Cloud credentials configured.
 
+### Context Caching Support
+
+Context caching helps reduce the cost and latency of requests that contain repeated content. The server supports both implicit caching (automatic) and explicit caching (manual).
+
+#### Implicit Caching
+Implicit caching is automatically enabled on supported Gemini models. You don't need to do anything special - just place large and common content at the beginning of your prompts.
+
+#### Explicit Caching
+For explicit control over caching, use the cache management endpoints:
+
+**Create a Context Cache:**
+```bash
+curl -X POST http://localhost:3000/v1/caches \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_GEMINI_API_KEY" \
+  -d '{
+    "model": "gemini-2.0-flash-001",
+    "display_name": "my-cache",
+    "system_instruction": "You are an expert researcher...",
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "file_data": {
+              "mime_type": "application/pdf",
+              "file_uri": "gs://your-bucket/document.pdf"
+            }
+          }
+        ]
+      }
+    ],
+    "ttl": "3600s"
+  }'
+```
+
+For Vertex AI mode, add these parameters:
+```json
+{
+  "use_vertex": true,
+  "google_cloud_project": "your-project-id",
+  "google_cloud_location": "us-central1",
+  ...
+}
+```
+
+**Use a Cached Content in Chat:**
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_GEMINI_API_KEY" \
+  -d '{
+    "model": "gemini-2.0-flash-001",
+    "cached_content": "projects/123456/locations/us-central1/cachedContents/abc123",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Summarize the document"
+      }
+    ]
+  }'
+```
+
+**List Caches:**
+```bash
+curl http://localhost:3000/v1/caches \
+  -H "Authorization: Bearer YOUR_GEMINI_API_KEY"
+```
+
+**Get Cache Details:**
+```bash
+curl http://localhost:3000/v1/caches/CACHE_ID \
+  -H "Authorization: Bearer YOUR_GEMINI_API_KEY"
+```
+
+**Update Cache TTL:**
+```bash
+curl -X PATCH http://localhost:3000/v1/caches/CACHE_ID \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_GEMINI_API_KEY" \
+  -d '{
+    "ttl": "7200s"
+  }'
+```
+
+**Delete a Cache:**
+```bash
+curl -X DELETE http://localhost:3000/v1/caches/CACHE_ID \
+  -H "Authorization: Bearer YOUR_GEMINI_API_KEY"
+```
+
+#### Cache Response Metadata
+
+When using cached content, the response includes `cached_content_token_count` in the usage metadata:
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 100,
+    "completion_tokens": 50,
+    "total_tokens": 150,
+    "cached_content_token_count": 2048
+  }
+}
+```
+
+#### Supported Models for Caching
+
+- Gemini 3 Flash/Pro
+- Gemini 2.5 Pro/Flash/Flash-Lite  
+- Gemini 2.0 Flash/Flash-Lite
+
+**Note:** Minimum cache size is 2,048 tokens. Maximum content size is 10MB.
+
 **Setting up server credentials for Vertex AI:**
 
 Option 1 - User credentials (for development):

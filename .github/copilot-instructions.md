@@ -112,6 +112,40 @@ interface OpenAIChatCompletionRequest {
   use_vertex?: boolean;                   // Use Google Cloud Vertex AI instead of Gemini AI
   google_cloud_project?: string;          // GCP project ID (required when use_vertex is true)
   google_cloud_location?: string;         // GCP region (required when use_vertex is true)
+  // Context caching
+  cached_content?: string;                // Cache resource name for explicit caching
+}
+```
+
+### Context Caching Support
+The server supports Gemini's context caching feature to reduce costs and latency for repeated content.
+
+**Cache Management Endpoints:**
+- `POST /v1/caches` - Create a new context cache
+- `GET /v1/caches` - List all caches
+- `GET /v1/caches/:id` - Get cache details
+- `PATCH /v1/caches/:id` - Update cache TTL
+- `DELETE /v1/caches/:id` - Delete a cache
+
+**Using Cached Content:**
+```typescript
+// In chat completion request
+{
+  "model": "gemini-2.0-flash-001",
+  "cached_content": "projects/123/locations/us-central1/cachedContents/abc",
+  "messages": [...]
+}
+```
+
+**Response includes cache metadata:**
+```typescript
+{
+  "usage": {
+    "prompt_tokens": 100,
+    "completion_tokens": 50,
+    "total_tokens": 150,
+    "cached_content_token_count": 2048  // Tokens from cache
+  }
 }
 ```
 

@@ -20,7 +20,11 @@ import {
   OpenAIMessage,
   OpenAIChatCompletionRequest,
   OpenAIChatCompletionResponse,
-  mapGeminiFinishReasonToOpenAI
+  mapGeminiFinishReasonToOpenAI,
+  CreateCacheRequest,
+  UpdateCacheRequest,
+  CacheResponse,
+  ListCachesResponse
 } from './types';
 
 const app = express();
@@ -103,7 +107,8 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
       modalities,
       use_vertex,
       google_cloud_project,
-      google_cloud_location
+      google_cloud_location,
+      cached_content
     } = requestBody;
 
     if (!modelName || !openAIMessages || !Array.isArray(openAIMessages)) {
@@ -128,6 +133,11 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
       console.log(`  Using Vertex AI mode:`);
       console.log(`    Project: ${google_cloud_project}`);
       console.log(`    Location: ${google_cloud_location}`);
+    }
+
+    // Log cached_content if provided
+    if (cached_content) {
+      console.log(`  Using cached content: ${cached_content}`);
     }
 
     // Initialize GoogleGenAI with appropriate configuration
@@ -166,10 +176,28 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
             }
         }
     }
+
+    // Collect secondary system messages (all system messages after the first one)
+    // These will be converted to user messages and placed at the end
+    const secondarySystemMessages: OpenAIMessage[] = [];
+    let foundFirstSystem = false;
+    for (const msg of openAIMessages) {
+      if (msg.role === 'system') {
+        if (foundFirstSystem) {
+          secondarySystemMessages.push(msg);
+        } else {
+          foundFirstSystem = true;
+        }
+      }
+    }
+    
+    if (secondarySystemMessages.length > 0) {
+      console.log(`  Found ${secondarySystemMessages.length} secondary system message(s) - will convert to user messages at end`);
+    }
     
     const geminiContents: Content[] = [];
     for (const openAIMsg of openAIMessages) {
-      if (openAIMsg.role === 'system') continue; // System message handled separately
+      if (openAIMsg.role === 'system') continue; // All system messages handled separately
       const currentGeminiParts: Part[] = [];
       const mediaPartsForGemini: Part[] = [];
       const textPartsForGemini: Part[] = [];
@@ -220,6 +248,29 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
         geminiContents.push({
           role: openAIMsg.role === 'assistant' ? 'model' : 'user',
           parts: currentGeminiParts,
+        });
+      }
+    }
+
+    // Append secondary system messages as user messages at the end
+    // These are context updates that should come after the conversation
+    for (const sysMsg of secondarySystemMessages) {
+      let textContent = '';
+      if (typeof sysMsg.content === 'string') {
+        textContent = sysMsg.content;
+      } else {
+        // Extract text from complex content
+        const textParts = sysMsg.content
+          .filter(p => p.type === 'text')
+          .map(p => (p as OpenAIContentTextPart).text);
+        textContent = textParts.join('\n');
+      }
+      
+      if (textContent) {
+        // Add as user message with [System] prefix to indicate it's system context
+        geminiContents.push({
+          role: 'user',
+          parts: [{ text: `[System Context]\n${textContent}` }],
         });
       }
     }
@@ -337,11 +388,30 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     }
     // If neither reasoning_effort nor thinking_level is provided, thinkingConfig is not set at all
 
-    const result: GenerateContentResponse = await genAI.models.generateContent({
-        model: modelName,
-        contents: geminiContents,
-        config: geminiAPIConfig, // Pass the combined config object
-    });
+    // Build the generateContent request options
+    const generateContentOptions: {
+      model: string;
+      contents: Content[];
+      config: GenerateContentConfig;
+      cachedContent?: string;
+    } = {
+      model: modelName,
+      contents: geminiContents,
+      config: geminiAPIConfig,
+    };
+
+    // Add cached content reference if provided
+    // Note: When using cached content, system_instruction, tools, and tool_config 
+    // should not be specified as they should be part of the cache
+    if (cached_content) {
+      generateContentOptions.cachedContent = cached_content;
+      // Clear system instruction from config when using cached content
+      // as it should already be part of the cache
+      delete geminiAPIConfig.systemInstruction;
+      delete geminiAPIConfig.tools;
+    }
+
+    const result: GenerateContentResponse = await genAI.models.generateContent(generateContentOptions);
     
     const geminiResponse = result; 
 
@@ -400,6 +470,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     const promptTokens = geminiResponse.usageMetadata?.promptTokenCount ?? 0;
     const completionTokens = geminiResponse.usageMetadata?.candidatesTokenCount ?? (geminiResponse.usageMetadata as any)?.candidateTokenCount ?? 0;
     const totalTokens = geminiResponse.usageMetadata?.totalTokenCount ?? (promptTokens + completionTokens);
+    const cachedContentTokenCount = geminiResponse.usageMetadata?.cachedContentTokenCount ?? (geminiResponse.usageMetadata as any)?.cachedContentTokenCount;
 
     const groundingDataChunks = geminiResponse.candidates[0].groundingMetadata?.groundingChunks;
 
@@ -449,6 +520,7 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
         total_tokens: totalTokens,
+        ...(cachedContentTokenCount ? { cached_content_token_count: cachedContentTokenCount } : {}),
       },
     };
 
@@ -523,6 +595,322 @@ app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<vo
     
     console.log('Final status code being returned:', statusCode);
     res.status(statusCode).json({ error: errorMessage, details: errorDetails });
+  }
+});
+
+// ============================================================================
+// Context Cache Management Endpoints
+// ============================================================================
+
+// Helper function to initialize GoogleGenAI client
+function initializeGenAI(req: Request, res: Response): { genAI: GoogleGenAI; useVertex: boolean; project?: string; location?: string } | null {
+  const authHeader = req.headers.authorization;
+  let apiKey: string | undefined;
+  
+  const useVertex = req.body.use_vertex === true || req.query.use_vertex === 'true';
+  const project = req.body.google_cloud_project || req.query.google_cloud_project;
+  const location = req.body.google_cloud_location || req.query.google_cloud_location;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    apiKey = authHeader.substring(7);
+  } else {
+    apiKey = process.env.GEMINI_API_KEY;
+  }
+
+  if (!apiKey && !useVertex) {
+    res.status(401).json({ 
+      error: 'API key not provided. Use Bearer token in Authorization header or set GEMINI_API_KEY environment variable.' 
+    });
+    return null;
+  }
+
+  if (useVertex) {
+    if (!project) {
+      res.status(400).json({ error: 'Missing google_cloud_project. Required when use_vertex is true.' });
+      return null;
+    }
+    if (!location) {
+      res.status(400).json({ error: 'Missing google_cloud_location. Required when use_vertex is true.' });
+      return null;
+    }
+    return {
+      genAI: new GoogleGenAI({ vertexai: true, project, location }),
+      useVertex: true,
+      project,
+      location
+    };
+  }
+
+  return {
+    genAI: new GoogleGenAI({ apiKey }),
+    useVertex: false
+  };
+}
+
+// Helper to convert cache response to our format
+function formatCacheResponse(cache: any): CacheResponse {
+  return {
+    name: cache.name,
+    model: cache.model,
+    display_name: cache.displayName,
+    create_time: cache.createTime,
+    update_time: cache.updateTime,
+    expire_time: cache.expireTime,
+    usage_metadata: cache.usageMetadata ? {
+      total_token_count: cache.usageMetadata.totalTokenCount
+    } : undefined
+  };
+}
+
+// Create a new context cache
+app.post('/v1/caches', async (req: Request, res: Response): Promise<void> => {
+  console.log(`[${new Date().toISOString()}] Creating context cache`);
+  
+  const clientResult = initializeGenAI(req, res);
+  if (!clientResult) return;
+  
+  const { genAI } = clientResult;
+  const requestBody = req.body as CreateCacheRequest;
+  
+  const { model, display_name, contents, system_instruction, ttl, expire_time } = requestBody;
+
+  if (!model) {
+    res.status(400).json({ error: 'Missing required field: model' });
+    return;
+  }
+
+  try {
+    // Build the cache creation config
+    const cacheConfig: any = {
+      model,
+    };
+
+    if (display_name) {
+      cacheConfig.displayName = display_name;
+    }
+
+    if (contents && Array.isArray(contents)) {
+      // Convert contents to Gemini format
+      cacheConfig.contents = contents.map(content => ({
+        role: content.role,
+        parts: content.parts.map(part => {
+          if (part.text) return { text: part.text };
+          if (part.file_data) {
+            return { fileData: { mimeType: part.file_data.mime_type, fileUri: part.file_data.file_uri } };
+          }
+          if (part.inline_data) {
+            return { inlineData: { mimeType: part.inline_data.mime_type, data: part.inline_data.data } };
+          }
+          return {};
+        })
+      }));
+    }
+
+    if (system_instruction) {
+      cacheConfig.systemInstruction = { parts: [{ text: system_instruction }] };
+    }
+
+    if (ttl) {
+      cacheConfig.ttl = ttl;
+    }
+
+    if (expire_time) {
+      cacheConfig.expireTime = expire_time;
+    }
+
+    console.log('Creating cache with config:', JSON.stringify(cacheConfig, null, 2));
+
+    const cache = await genAI.caches.create(cacheConfig);
+    
+    console.log('Cache created:', JSON.stringify(cache, null, 2));
+    
+    res.status(201).json(formatCacheResponse(cache));
+  } catch (error: any) {
+    console.error('Error creating cache:', error.message, error.stack);
+    res.status(500).json({ 
+      error: 'Failed to create context cache', 
+      details: error.message 
+    });
+  }
+});
+
+// List all context caches
+app.get('/v1/caches', async (req: Request, res: Response): Promise<void> => {
+  console.log(`[${new Date().toISOString()}] Listing context caches`);
+  
+  const clientResult = initializeGenAI(req, res);
+  if (!clientResult) return;
+  
+  const { genAI } = clientResult;
+
+  try {
+    const pageSize = parseInt(req.query.page_size as string) || 100;
+    const pageToken = req.query.page_token as string;
+
+    const listConfig: any = { pageSize };
+    if (pageToken) {
+      listConfig.pageToken = pageToken;
+    }
+
+    const result = await genAI.caches.list(listConfig);
+    
+    const caches: CacheResponse[] = [];
+    // Handle the async iterator result from the SDK
+    if (result) {
+      for await (const cache of result as AsyncIterable<any>) {
+        caches.push(formatCacheResponse(cache));
+      }
+    }
+
+    const response: ListCachesResponse = {
+      caches,
+      // Note: pageToken handling depends on SDK implementation
+    };
+
+    res.json(response);
+  } catch (error: any) {
+    console.error('Error listing caches:', error.message, error.stack);
+    res.status(500).json({ 
+      error: 'Failed to list context caches', 
+      details: error.message 
+    });
+  }
+});
+
+// Get a specific context cache
+app.get('/v1/caches/:cacheId', async (req: Request, res: Response): Promise<void> => {
+  const cacheId = req.params.cacheId;
+  console.log(`[${new Date().toISOString()}] Getting context cache: ${cacheId}`);
+  
+  const clientResult = initializeGenAI(req, res);
+  if (!clientResult) return;
+  
+  const { genAI } = clientResult;
+
+  try {
+    // The cacheId might be the full resource name or just the ID
+    // Full format: projects/{project}/locations/{location}/cachedContents/{cacheId}
+    const cacheName = cacheId.includes('/') ? cacheId : cacheId;
+    
+    const cache = await genAI.caches.get({ name: cacheName });
+    
+    if (!cache) {
+      res.status(404).json({ error: 'Context cache not found', cache_id: cacheId });
+      return;
+    }
+
+    res.json(formatCacheResponse(cache));
+  } catch (error: any) {
+    console.error('Error getting cache:', error.message, error.stack);
+    if (error.message?.includes('not found') || error.message?.includes('404')) {
+      res.status(404).json({ error: 'Context cache not found', cache_id: cacheId });
+    } else {
+      res.status(500).json({ 
+        error: 'Failed to get context cache', 
+        details: error.message 
+      });
+    }
+  }
+});
+
+// Update a context cache (TTL/expiration time only)
+app.patch('/v1/caches/:cacheId', async (req: Request, res: Response): Promise<void> => {
+  const cacheId = req.params.cacheId;
+  console.log(`[${new Date().toISOString()}] Updating context cache: ${cacheId}`);
+  
+  const clientResult = initializeGenAI(req, res);
+  if (!clientResult) return;
+  
+  const { genAI } = clientResult;
+  const { ttl, expire_time } = req.body as UpdateCacheRequest;
+
+  if (!ttl && !expire_time) {
+    res.status(400).json({ error: 'At least one of ttl or expire_time must be provided' });
+    return;
+  }
+
+  try {
+    const cacheName = cacheId.includes('/') ? cacheId : cacheId;
+    
+    const updateConfig: any = { name: cacheName };
+    if (ttl) {
+      updateConfig.ttl = ttl;
+    }
+    if (expire_time) {
+      updateConfig.expireTime = expire_time;
+    }
+
+    const cache = await genAI.caches.update(updateConfig);
+    
+    res.json(formatCacheResponse(cache));
+  } catch (error: any) {
+    console.error('Error updating cache:', error.message, error.stack);
+    if (error.message?.includes('not found') || error.message?.includes('404')) {
+      res.status(404).json({ error: 'Context cache not found', cache_id: cacheId });
+    } else {
+      res.status(500).json({ 
+        error: 'Failed to update context cache', 
+        details: error.message 
+      });
+    }
+  }
+});
+
+// Delete a context cache
+app.delete('/v1/caches/:cacheId', async (req: Request, res: Response): Promise<void> => {
+  const cacheId = req.params.cacheId;
+  console.log(`[${new Date().toISOString()}] Deleting context cache: ${cacheId}`);
+  
+  // Handle query params for GET-style auth in DELETE
+  const authHeader = req.headers.authorization;
+  let apiKey: string | undefined;
+  
+  const useVertex = req.query.use_vertex === 'true';
+  const project = req.query.google_cloud_project as string;
+  const location = req.query.google_cloud_location as string;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    apiKey = authHeader.substring(7);
+  } else {
+    apiKey = process.env.GEMINI_API_KEY;
+  }
+
+  if (!apiKey && !useVertex) {
+    res.status(401).json({ 
+      error: 'API key not provided. Use Bearer token in Authorization header or set GEMINI_API_KEY environment variable.' 
+    });
+    return;
+  }
+
+  let genAI: GoogleGenAI;
+  if (useVertex) {
+    if (!project || !location) {
+      res.status(400).json({ 
+        error: 'Missing google_cloud_project or google_cloud_location. Required when use_vertex is true.' 
+      });
+      return;
+    }
+    genAI = new GoogleGenAI({ vertexai: true, project, location });
+  } else {
+    genAI = new GoogleGenAI({ apiKey });
+  }
+
+  try {
+    const cacheName = cacheId.includes('/') ? cacheId : cacheId;
+    
+    await genAI.caches.delete({ name: cacheName });
+    
+    res.status(204).send();
+  } catch (error: any) {
+    console.error('Error deleting cache:', error.message, error.stack);
+    if (error.message?.includes('not found') || error.message?.includes('404')) {
+      res.status(404).json({ error: 'Context cache not found', cache_id: cacheId });
+    } else {
+      res.status(500).json({ 
+        error: 'Failed to delete context cache', 
+        details: error.message 
+      });
+    }
   }
 });
 

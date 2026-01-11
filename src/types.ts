@@ -43,6 +43,65 @@ export interface OpenAIChatCompletionRequest {
   use_vertex?: boolean; // If true, use Google Cloud Vertex AI instead of Gemini AI
   google_cloud_project?: string; // Required when use_vertex is true
   google_cloud_location?: string; // Required when use_vertex is true (e.g., 'us-central1', 'global')
+  // Context caching support
+  cached_content?: string; // Cache resource name (e.g., 'projects/.../locations/.../cachedContents/...')
+}
+
+// Context Cache Types
+export interface CacheContentPart {
+  text?: string;
+  file_data?: {
+    mime_type: string;
+    file_uri: string;
+  };
+  inline_data?: {
+    mime_type: string;
+    data: string; // base64 encoded
+  };
+}
+
+export interface CacheContent {
+  role: 'user' | 'model';
+  parts: CacheContentPart[];
+}
+
+export interface CreateCacheRequest {
+  model: string;
+  display_name?: string;
+  contents?: CacheContent[];
+  system_instruction?: string;
+  ttl?: string; // Duration string like "3600s" for 1 hour
+  expire_time?: string; // ISO 8601 timestamp
+  // Vertex AI configuration (required for cache operations)
+  use_vertex?: boolean;
+  google_cloud_project?: string;
+  google_cloud_location?: string;
+}
+
+export interface UpdateCacheRequest {
+  ttl?: string;
+  expire_time?: string;
+  // Vertex AI configuration
+  use_vertex?: boolean;
+  google_cloud_project?: string;
+  google_cloud_location?: string;
+}
+
+export interface CacheResponse {
+  name: string;
+  model: string;
+  display_name?: string;
+  create_time: string;
+  update_time: string;
+  expire_time: string;
+  usage_metadata?: {
+    total_token_count: number;
+  };
+}
+
+export interface ListCachesResponse {
+  caches: CacheResponse[];
+  next_page_token?: string;
 }
 
 export interface OpenAIChatCompletionResponse {
@@ -62,6 +121,7 @@ export interface OpenAIChatCompletionResponse {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
+    cached_content_token_count?: number; // Token count from cached content
   };
 }
 
